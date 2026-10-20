@@ -1,94 +1,93 @@
--- RFM 用户分层（90 天）
--- 分析截止日：2026-03-17
--- R：最近一次购买距截止日的天数
--- F：窗口内订单次数
--- M：按销售额从高到低累计，累计贡献 ≤80% 为高，≤95% 为中，其余为低
--- 注意：M 不是「人数前 20%」，而是「金额累计贡献」
+-- rfm_90.sql
+-- 窗口与渠道 roi 对齐：2025-12-17 ~ 2026-03-17，只算 paid
+-- r：距 2026-03-17 最近一次购买天数，<=45 高、<=75 中、否则低
+-- f：窗内订单次数，>=3 高、=2 中、=1 低
+-- m：用户 gmv 从高到低累计，至 80% 金额为高、至 95% 为中、其余为低（不是前 20% 的人）
 
-DROP TABLE IF EXISTS RFM_90;
+drop table if exists rfm_90;
 
-CREATE TABLE RFM_90 AS
-WITH r_data AS (
-    SELECT
-        user_id,
-        DATEDIFF('2026-03-17', MAX(payment_time)) AS r_value,
-        CASE
-            WHEN DATEDIFF('2026-03-17', MAX(payment_time)) <= 45 THEN '高'
-            WHEN DATEDIFF('2026-03-17', MAX(payment_time)) <= 75 THEN '中'
-            ELSE '低'
-        END AS R
-    FROM order_master
-    WHERE payment_time <= '2026-03-17'
-      AND payment_time >= DATE_ADD('2026-03-17', INTERVAL -90 DAY)
-    GROUP BY user_id
+create table rfm_90 as
+with r_data as (
+    select user_id,
+           datediff('2026-03-17', max(order_time)) as r_value,
+           case
+               when datediff('2026-03-17', max(order_time)) <= 45 then '高'
+               when datediff('2026-03-17', max(order_time)) <= 75 then '中'
+               else '低'
+           end as r
+    from order_master
+    where order_time >= '2025-12-17'
+      and order_time <= '2026-03-17 23:59:59'
+      and payment_status = 'paid'
+    group by user_id
 ),
-f_data AS (
-    SELECT
-        user_id,
-        COUNT(order_id) AS f_value,
-        CASE
-            WHEN COUNT(order_id) >= 3 THEN '高'
-            WHEN COUNT(order_id) = 2 THEN '中'
-            ELSE '低'
-        END AS F
-    FROM order_master
-    WHERE payment_time <= '2026-03-17'
-      AND payment_time >= DATE_ADD('2026-03-17', INTERVAL -90 DAY)
-    GROUP BY user_id
+f_data as (
+    select user_id,
+           count(order_id) as f_value,
+           case
+               when count(order_id) >= 3 then '高'
+               when count(order_id) = 2 then '中'
+               else '低'
+           end as f
+    from order_master
+    where order_time >= '2025-12-17'
+      and order_time <= '2026-03-17 23:59:59'
+      and payment_status = 'paid'
+    group by user_id
 ),
-m_data AS (
-    WITH sum_temp AS (
-        SELECT
-            user_id,
-            SUM(payment_amount) AS total_amount
-        FROM order_master
-        WHERE payment_time <= '2026-03-17'
-          AND payment_time >= DATE_ADD('2026-03-17', INTERVAL -90 DAY)
-        GROUP BY user_id
+m_data as (
+    with sum_temp as (
+        select user_id,
+               sum(payment_amount) as total_amount
+        from order_master
+        where order_time >= '2025-12-17'
+          and order_time <= '2026-03-17 23:59:59'
+          and payment_status = 'paid'
+        group by user_id
     ),
-    ranked_temp AS (
-        SELECT
-            user_id,
-            total_amount,
-            SUM(total_amount) OVER (ORDER BY total_amount DESC)
-                / (SELECT SUM(total_amount) FROM sum_temp) AS cum_percent
-        FROM sum_temp
+    ranked_temp as (
+        select user_id,
+               total_amount,
+               sum(total_amount) over (order by total_amount desc)
+                   / (select sum(total_amount) from sum_temp) as cum_percent
+        from sum_temp
     )
-    SELECT
-        user_id,
-        total_amount,
-        CASE
-            WHEN cum_percent <= 0.80 THEN '高'
-            WHEN cum_percent <= 0.95 THEN '中'
-            ELSE '低'
-        END AS M
-    FROM ranked_temp
+    select user_id,
+           total_amount,
+           case
+               when cum_percent <= 0.80 then '高'
+               when cum_percent <= 0.95 then '中'
+               else '低'
+           end as m
+    from ranked_temp
 )
-SELECT
-    r.user_id,
-    r.R,
-    r.r_value,
-    f.F,
-    f.f_value,
-    m.M,
-    m.total_amount,
-    CONCAT(r.R, f.F, m.M) AS RFM_Code,
-    CASE
-        WHEN r.R = '高' AND f.F = '高' AND m.M = '高' THEN '重要价值客户 (VIP)'
-        WHEN r.R = '高' AND f.F = '高' AND m.M = '低' THEN '重要发展客户 (需提客单)'
-        WHEN r.R = '高' AND f.F = '低' AND m.M = '高' THEN '重要保持客户 (需维持)'
-        WHEN r.R = '低' AND f.F = '高' AND m.M = '高' THEN '重要挽留客户 (需召回!)'
-        WHEN r.R = '低' AND f.F = '低' AND m.M = '低' THEN '低价值客户 (路人)'
-        ELSE '普通客户'
-    END AS Customer_Tag
-FROM r_data r
-JOIN f_data f ON r.user_id = f.user_id
-JOIN m_data m ON r.user_id = m.user_id;
+select r.user_id,
+       r.r,
+       r.r_value,
+       f.f,
+       f.f_value,
+       m.m,
+       m.total_amount,
+       concat(r.r, f.f, m.m) as rfm_code,
+       case
+           when r.r = '高' and f.f = '高' and m.m = '高' then '重要价值客户 (VIP)'
+           when r.r = '高' and f.f = '高' and m.m = '低' then '重要发展客户 (需提客单)'
+           when r.r = '高' and f.f = '低' and m.m = '高' then '重要保持客户 (需维持)'
+           when r.r = '低' and f.f = '高' and m.m = '高' then '重要挽留客户 (需召回!)'
+           when r.r = '低' and f.f = '低' and m.m = '低' then '低价值客户 (路人)'
+           else '普通客户'
+       end as customer_tag
+from r_data r
+join f_data f on r.user_id = f.user_id
+join m_data m on r.user_id = m.user_id;
 
-SELECT
-    Customer_Tag,
-    ROUND(COUNT(DISTINCT user_id) / (SELECT COUNT(DISTINCT user_id) FROM RFM_90) * 100, 2) AS 标签人数占比,
-    ROUND(SUM(total_amount) / (SELECT SUM(total_amount) FROM RFM_90) * 100, 2) AS 金额占比
-FROM RFM_90
-GROUP BY Customer_Tag
-ORDER BY 金额占比 DESC;
+
+-- 分层结果：同时看人数占比和金额占比
+select customer_tag,
+       count(distinct user_id) as 用户数,
+       round(count(distinct user_id) / (select count(distinct user_id) from rfm_90), 4) as 人数占比,
+       round(sum(total_amount), 2) as 总金额,
+       round(sum(total_amount) / (select sum(total_amount) from rfm_90), 4) as 金额占比
+from rfm_90
+group by customer_tag
+order by 金额占比 desc;
